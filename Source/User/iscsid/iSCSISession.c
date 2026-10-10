@@ -793,17 +793,11 @@ errno_t iSCSISessionLogin(iSCSISessionManagerRef managerRef,
     iSCSIHBAInterfaceRef hbaInterface = iSCSISessionManagerGetHBAInterface(managerRef);
     errno_t error = 0;
 
-#define ZKLOG(...) do{ FILE*_f=fopen("/tmp/iscsi_login.log","a"); if(_f){fprintf(_f,__VA_ARGS__);fclose(_f);} }while(0)
-    ZKLOG("== iSCSISessionLogin begin, hbaInterface=%p ==\n",(void*)hbaInterface);
-
     // Resolve the target address
     struct sockaddr_storage ssTarget, ssHost;
 
-    if((error = iSCSIUtilsGetAddressForPortal(portal,&ssTarget,&ssHost))) {
-        ZKLOG("GetAddressForPortal FAILED error=%d (%s)\n",error,strerror(error));
+    if((error = iSCSIUtilsGetAddressForPortal(portal,&ssTarget,&ssHost)))
         return error;
-    }
-    ZKLOG("GetAddressForPortal OK targetfam=%d hostfam=%d\n",ssTarget.ss_family,ssHost.ss_family);
 
     // Create a new session in the kernel.  This allocates session and
     // connection identifiers
@@ -813,27 +807,20 @@ errno_t iSCSISessionLogin(iSCSISessionManagerRef managerRef,
                                            iSCSIPortalGetPort(portal),
                                            iSCSIPortalGetHostInterface(portal),
                                            &ssTarget,&ssHost,sessionId,connectionId);
-    ZKLOG("CreateSession returned error=%d (%s) sid=%d cid=%d\n",error,strerror(error),*sessionId,*connectionId);
 
     // If session couldn't be allocated were maxed out; try again later
-    if(!error && (*sessionId == kiSCSIInvalidSessionId || *connectionId == kiSCSIInvalidConnectionId)) {
-        ZKLOG("CreateSession gave invalid ids -> EAGAIN\n");
+    if(!error && (*sessionId == kiSCSIInvalidSessionId || *connectionId == kiSCSIInvalidConnectionId))
         return EAGAIN;
-    }
 
     // If no error, authenticate (negotiate security parameters)
     if(!error) {
         error = iSCSIAuthNegotiate(managerRef,target,initiatorAuth,targetAuth,
                                    *sessionId,*connectionId,statusCode);
-        ZKLOG("AuthNegotiate returned error=%d (%s) statusCode=%d\n",error,strerror(error),*statusCode);
     }
 
     // Negotiate session & connection parameters
-    if(!error && *statusCode == kiSCSILoginSuccess) {
+    if(!error && *statusCode == kiSCSILoginSuccess)
         error = iSCSINegotiateSession(managerRef,target,*sessionId,*connectionId,sessCfg,connCfg,statusCode);
-        ZKLOG("NegotiateSession returned error=%d (%s) statusCode=%d\n",error,strerror(error),*statusCode);
-    }
-    ZKLOG("== login end: error=%d statusCode=%d ==\n",error,*statusCode);
 
     // Only activate connections for kernel use if no errors have occurred and
     // the session is not a discovery session

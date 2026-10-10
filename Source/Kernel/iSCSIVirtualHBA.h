@@ -140,6 +140,9 @@ public:
 	/*! Stops controller. */
 	virtual void StopController();
 
+    /*! Quiesces outstanding I/O during system power-off/restart. */
+    virtual void systemWillShutdown(IOOptionBits specifier);
+
 	/*! Handles hardware interrupts (not used for this virtual HBA). */
 	virtual void HandleInterruptRequest();
     
@@ -408,6 +411,21 @@ private:
     
     
 	
+    /*! Enter shutdown mode, stop network I/O and fail queued SCSI tasks. */
+    void QuiesceControllerForShutdown();
+
+    /*! Workloop-gated half of shutdown quiescing. */
+    static IOReturn QuiesceControllerGated(OSObject * owner,
+                                            void * arg0,
+                                            void * arg1,
+                                            void * arg2,
+                                            void * arg3);
+
+    /*! Fail every queued SCSI request on one connection without feeding
+     *  shutdown cancellations into throughput/latency accounting. */
+    void FailPendingTasksForConnection(iSCSISession * session,
+                                       iSCSIConnection * connection);
+
     /*! Maximum allowable sessions. */
     static const UInt16 kMaxSessions;
     
@@ -493,6 +511,13 @@ private:
      *  initialization of the initiator and the 24 least significant bits
      *  are used to form part of the iSCSI ISID. */
     SCSIInitiatorIdentifier kInitiatorId;
+
+    /*! Set once shutdown/stop begins. New SCSI work is rejected. */
+    volatile UInt32 shuttingDown;
+
+    /*! Number of ProcessParallelTask submissions currently between the
+     *  shutdown check and queue insertion. Used to close the shutdown race. */
+    volatile SInt32 ioSubmissionsInFlight;
 	
 	/*! Lookup table that maps iSCSI sessions to ISID qualifiers
      *  (session qualifier IDs). */

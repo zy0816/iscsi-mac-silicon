@@ -91,31 +91,43 @@ void iSCSITaskQueue::queueTask(UInt32 initiatorTaskTag)
 UInt32 iSCSITaskQueue::completeCurrentTask()
 {
     UInt32 taskTag = 0;
+    completeCurrentTask(&taskTag);
+    return taskTag;
+}
+
+bool iSCSITaskQueue::completeCurrentTask(UInt32 * taskTag)
+{
+    if(!taskTag)
+        return false;
+
     iSCSITask * task = NULL;
-    
-    // Do nothing if the queue is empty
+
+    // Do nothing if the queue is empty.
     if(queue_empty(&taskQueue))
-        return taskTag;
-    
+        return false;
+
     // Remove the completed task (at the head of the queue) and then
-    // move onto the next task if one exists
+    // move onto the next task if one exists.
     if(!onThread())
         OSDynamicCast(iSCSIVirtualHBA,owner)->GetCommandGate();
 
-    queue_remove_first(&taskQueue,task,iSCSITask *, queueChain);
+    queue_remove_first(&taskQueue,task,iSCSITask *,queueChain);
 
-    if(task) {
-        taskTag = task->initiatorTaskTag;
-        IOFree(task,sizeof(iSCSITask));
-    }
-    
-    // If there are still tasks to process let the HBA know...
-    if(!queue_empty(&taskQueue)) {
+    if(!task)
+        return false;
+
+    *taskTag = task->initiatorTaskTag;
+    IOFree(task,sizeof(iSCSITask));
+
+    // If there are still tasks to process let the HBA know.
+    if(!queue_empty(&taskQueue))
+    {
         newTask = true;
         if(getWorkLoop())
             signalWorkAvailable();
     }
-    return taskTag;
+
+    return true;
 }
 
 

@@ -45,6 +45,16 @@ Everything here builds with the **Command Line Tools only** — no full Xcode re
 > ⚠️ Disabling SIP lowers your Mac's security. Do it only if you understand the
 > trade-off. 关闭 SIP 会降低系统安全性，请知悉后再操作。
 
+## v1.0.1 — Shutdown / restart handling
+
+- Register the HBA in the IOPower plane to participate in system shutdown.
+- Quiesce new I/O and interrupt blocked socket receives during shutdown/stop.
+- Complete pending SCSI requests with a delivery-failure response.
+- Fix ambiguous task-tag zero handling by distinguishing dequeue success from task ID.
+- Add scripts for next-boot KEXT staging and post-reboot verification.
+
+**Note:** Compiled and loaded on Apple Silicon, but long-term shutdown-stability testing remains necessary. Back up important data and disconnect active iSCSI volumes before running the full installer over an existing installation. The PKG is not Developer ID signed or notarized.
+
 ## Install / 安装
 
 1. Download the latest `iSCSI-for-Apple-Silicon-x.y.z.dmg` from
@@ -67,7 +77,7 @@ git clone <this-repo> && cd iSCSIInitiator
 cd App && ./build_app.sh && cd ..
 
 # 3. the installer  (.pkg wrapped in .dmg)
-cd Installer && ./build_installer.sh 1.0.0
+cd Installer && ./build_installer.sh 1.0.1
 ```
 
 Or install the built components in place for development:

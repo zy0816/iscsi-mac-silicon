@@ -7,6 +7,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Needed so softprops/action-gh-release can create/update the GitHub Release
+# (default GITHUB_TOKEN is read-only for contents otherwise).
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14        # Apple Silicon runner
@@ -26,8 +31,11 @@ jobs:
 
       - name: Build installer (.pkg + .dmg)
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          [ -z "$VERSION" ] && VERSION="0.0.0-ci"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^VERSION=\"\\([^\"]*\\)\"/\\1/p' build_kext.sh | head -1)"
+          fi
           cd Installer && ./build_installer.sh "$VERSION"
 
       - name: Upload artifacts

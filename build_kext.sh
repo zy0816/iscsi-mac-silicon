@@ -13,7 +13,7 @@ SHARED="Source/User/iSCSI Framework"
 
 BUNDLE_ID="com.github.iscsi-osx.iSCSIInitiator"
 KEXT_NAME="iSCSIInitiator"
-VERSION="1.0.0"
+VERSION="1.0.1"
 BUILD="build"
 KEXT="$BUILD/$KEXT_NAME.kext"
 # Apple Silicon kernel + kexts are arm64e with the kernel ABI. The kmod

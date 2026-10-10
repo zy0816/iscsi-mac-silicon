@@ -77,8 +77,15 @@ public:
     
     /*! Removes a task from the queue (either the task has been successfully
      *  completed or aborted).
-     *  @return the iSCSI task tag for the task that was just completed. */
+     *  @return the iSCSI task tag for the task that was just completed.
+     *  Legacy callers that ignore emptiness keep the historical zero return. */
     UInt32 completeCurrentTask();
+
+    /*! Removes a task and reports emptiness separately so task tag 0 remains
+     *  a valid value.
+     *  @param taskTag receives the removed task's initiator tag.
+     *  @return true if a task was removed; false if the queue was empty. */
+    bool completeCurrentTask(UInt32 * taskTag);
     
     /*! Removes all tasks from the queue. */
     void clearTasksFromQueue();

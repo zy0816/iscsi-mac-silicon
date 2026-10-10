@@ -39,6 +39,10 @@
 #include <sys/select.h>
 
 #include <IOKit/IORegistryEntry.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/IOCommandGate.h>
+#include <IOKit/IOLib.h>
+#include <libkern/OSAtomic.h>
 
 // Use DBLog() for debug outputs and IOLog() for all outputs
 // DBLog() is only enabled for debug builds
@@ -339,6 +343,9 @@ bool iSCSIVirtualHBA::DoesHBAPerformDeviceManagement()
 bool iSCSIVirtualHBA::InitializeController()
 {
     DBLog("iscsi: Initializing virtual HBA\n");
+
+    shuttingDown = 0;
+    ioSubmissionsInFlight = 0;
     
     // Initialize CRC32C
     crc32c_init();
@@ -359,8 +366,16 @@ bool iSCSIVirtualHBA::InitializeController()
     // Generate an initiator id using a random number (per RFC3720)
     kInitiatorId = random();
     
-    // Make ourselves discoverable to user clients (we do this last after
-    // everything is initialized).
+    // IOSCSIParallelInterfaceController does not initialize power management.
+    // Join the power plane explicitly so systemWillShutdown() is delivered.
+    PMinit();
+    IOService * powerProvider = GetProvider();
+    if(powerProvider)
+        powerProvider->joinPMtree(this);
+
+    IOLog("iscsi: HBA joined IOPower plane\n");
+
+    // Make ourselves discoverable to user clients only after PM registration.
     registerService();
 
     
@@ -371,12 +386,24 @@ bool iSCSIVirtualHBA::InitializeController()
 void iSCSIVirtualHBA::TerminateController()
 {
     DBLog("iscsi: Terminating virtual HBA\n");
+
+    QuiesceControllerForShutdown();
     
     ReleaseAllSessions();
     
     // Free up our list of sessions and targets
     IOFree(sessionList,kMaxSessions*sizeof(iSCSISession*));
-    targetList->free();
+    sessionList = NULL;
+
+    if(targetList)
+    {
+        targetList->release();
+        targetList = NULL;
+    }
+
+    // Match PMinit()/joinPMtree() from InitializeController(). PMstop() is
+    // harmless if the power-plane detach is already in progress.
+    PMstop();
 }
 
 bool iSCSIVirtualHBA::StartController()
@@ -387,6 +414,119 @@ bool iSCSIVirtualHBA::StartController()
 
 void iSCSIVirtualHBA::StopController()
 {
+    QuiesceControllerForShutdown();
+}
+
+void iSCSIVirtualHBA::systemWillShutdown(IOOptionBits specifier)
+{
+    IOLog("iscsi: systemWillShutdown(0x%x) begin\n",(unsigned)specifier);
+
+    if(specifier == kIOMessageSystemWillPowerOff ||
+       specifier == kIOMessageSystemWillRestart)
+        QuiesceControllerForShutdown();
+
+    super::systemWillShutdown(specifier);
+
+    IOLog("iscsi: systemWillShutdown(0x%x) complete\n",(unsigned)specifier);
+}
+
+void iSCSIVirtualHBA::QuiesceControllerForShutdown()
+{
+    if(!OSCompareAndSwap(0,1,&shuttingDown))
+        return;
+
+    IOLog("iscsi: shutdown quiesce begin\n");
+
+    for(UInt32 waitMs = 0; waitMs < 250 && ioSubmissionsInFlight != 0; waitMs++)
+        IOSleep(1);
+
+    if(ioSubmissionsInFlight != 0)
+        IOLog("iscsi: shutdown continuing with %d submission(s) in flight\n",
+              (int)ioSubmissionsInFlight);
+
+    // Break any blocked socket receive before waiting for the workloop gate.
+    for(SessionIdentifier sid = 0; sid < kMaxSessions; sid++)
+    {
+        iSCSISession * session = sessionList ? sessionList[sid] : NULL;
+        if(!session)
+            continue;
+
+        for(ConnectionIdentifier cid = 0; cid < kMaxConnectionsPerSession; cid++)
+        {
+            iSCSIConnection * connection = session->connections[cid];
+            if(!connection)
+                continue;
+
+            if(connection->dataRecvEventSource)
+                connection->dataRecvEventSource->disable();
+
+            if(connection->socket)
+                sock_shutdown(connection->socket,SHUT_RDWR);
+        }
+    }
+
+    IOCommandGate * gate = GetCommandGate();
+    IOReturn result = kIOReturnSuccess;
+    if(gate)
+        result = gate->runAction(&iSCSIVirtualHBA::QuiesceControllerGated);
+    else
+        result = QuiesceControllerGated(this,NULL,NULL,NULL,NULL);
+
+    IOLog("iscsi: shutdown quiesce complete (0x%x)\n",(unsigned)result);
+}
+
+IOReturn iSCSIVirtualHBA::QuiesceControllerGated(OSObject * owner,
+                                                  void * arg0,
+                                                  void * arg1,
+                                                  void * arg2,
+                                                  void * arg3)
+{
+    iSCSIVirtualHBA * hba = OSDynamicCast(iSCSIVirtualHBA,owner);
+    if(!hba)
+        return kIOReturnBadArgument;
+
+    for(SessionIdentifier sid = 0; sid < kMaxSessions; sid++)
+    {
+        iSCSISession * session = hba->sessionList ? hba->sessionList[sid] : NULL;
+        if(!session)
+            continue;
+
+        for(ConnectionIdentifier cid = 0; cid < kMaxConnectionsPerSession; cid++)
+        {
+            if(session->connections[cid])
+                hba->DeactivateConnection(sid,cid);
+        }
+    }
+
+    return kIOReturnSuccess;
+}
+
+void iSCSIVirtualHBA::FailPendingTasksForConnection(iSCSISession * session,
+                                                     iSCSIConnection * connection)
+{
+    if(!session || !connection || !connection->taskQueue)
+        return;
+
+    UInt32 initiatorTaskTag = 0;
+
+    while(connection->taskQueue->completeCurrentTask(&initiatorTaskTag))
+    {
+        if(ParseInitiatorTaskTagForTaskType(initiatorTaskTag) !=
+           kInitiatorTaskTypeSCSITask)
+            continue;
+
+        SCSIParallelTaskIdentifier task =
+            FindTaskForControllerIdentifier(session->sessionId,initiatorTaskTag);
+        if(!task)
+            continue;
+
+        super::CompleteParallelTask(
+            task,
+            kSCSITaskStatus_DeliveryFailure,
+            kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE);
+    }
+
+    connection->dataToTransfer = 0;
 }
 
 void iSCSIVirtualHBA::HandleInterruptRequest()
@@ -443,6 +583,9 @@ void iSCSIVirtualHBA::HandleTimeout(SCSIParallelTaskIdentifier task)
  *  @param connectionId the connection that timed out. */
 void iSCSIVirtualHBA::HandleConnectionTimeout(SessionIdentifier sessionId,ConnectionIdentifier connectionId)
 {
+    if(shuttingDown)
+        return;
+
     // If this is the last connection, release the session...
     iSCSISession * session;
     
@@ -479,6 +622,16 @@ void iSCSIVirtualHBA::HandleConnectionTimeout(SessionIdentifier sessionId,Connec
 
 SCSIServiceResponse iSCSIVirtualHBA::ProcessParallelTask(SCSIParallelTaskIdentifier parallelTask)
 {
+    if(shuttingDown)
+        return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+
+    OSIncrementAtomic(&ioSubmissionsInFlight);
+    if(shuttingDown)
+    {
+        OSDecrementAtomic(&ioSubmissionsInFlight);
+        return kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+    }
+
     // Here we set an (iSCSI) initiator task tag for the SCSI task and queue
     // the iSCSI task for later processing
     SCSITargetIdentifier targetId   = GetTargetIdentifier(parallelTask);
@@ -488,7 +641,10 @@ SCSIServiceResponse iSCSIVirtualHBA::ProcessParallelTask(SCSIParallelTaskIdentif
     iSCSISession * session = sessionList[(SessionIdentifier)targetId];
     
     if(!session)
+    {
+        OSDecrementAtomic(&ioSubmissionsInFlight);
         return kSCSIServiceResponse_FUNCTION_REJECTED;
+    }
     
     // Determine which connection this task should be assigned to based on
     // bitrate and processing load; we do this by looking at the amount of
@@ -519,7 +675,10 @@ SCSIServiceResponse iSCSIVirtualHBA::ProcessParallelTask(SCSIParallelTaskIdentif
     
     connection = session->connections[0];
     if(!connection || !connection->dataRecvEventSource)
+    {
+        OSDecrementAtomic(&ioSubmissionsInFlight);
         return kSCSIServiceResponse_FUNCTION_REJECTED;
+    }
     
     // Associate a connection identifier with this task; this is used to
     // maintain the connection associated with a task when only task information
@@ -543,6 +702,7 @@ SCSIServiceResponse iSCSIVirtualHBA::ProcessParallelTask(SCSIParallelTaskIdentif
     DBLog("iscsi: Queued task %#x (sid: %d, cid: %d)\n",
           initiatorTaskTag,session->sessionId,connection->cid);
 
+    OSDecrementAtomic(&ioSubmissionsInFlight);
     return kSCSIServiceResponse_Request_In_Process;
 }
 
@@ -551,6 +711,9 @@ void iSCSIVirtualHBA::BeginTaskOnWorkloopThread(iSCSIVirtualHBA * owner,
                                                 iSCSIConnection * connection,
                                                 UInt32 initiatorTaskTag)
 {
+    if(!owner || owner->shuttingDown)
+        return;
+
     // Task tag corresponding to a connection timeout measurement
     if(owner->ParseInitiatorTaskTagForTaskType(initiatorTaskTag) == kInitiatorTaskTypeLatency)  {
         owner->MeasureConnectionLatency(session,connection);
@@ -687,7 +850,7 @@ bool iSCSIVirtualHBA::ProcessTaskOnWorkloopThread(iSCSIVirtualHBA * owner,
                                                   iSCSIConnection * connection)
 {
     // Quit if the connection isn't active (if it is not in full feature phase)
-    if(!owner || !session || !connection)
+    if(!owner || owner->shuttingDown || !session || !connection)
         return true;
  
     // Grab incoming bhs (we are guaranteed to have a basic header at this
@@ -1593,7 +1756,6 @@ errno_t iSCSIVirtualHBA::CreateConnection(SessionIdentifier sessionId,
                         (sock_upcall)&iSCSIIOEventSource::socketCallback,
                         newConn->dataRecvEventSource,
                         &newConn->socket);
-    IOLog("ISCSIX: sock_socket family=%d err=%d\n",portalSockaddr->ss_family,error);
     if(error)
         goto SOCKET_CREATE_FAILURE;
 
@@ -1607,13 +1769,11 @@ errno_t iSCSIVirtualHBA::CreateConnection(SessionIdentifier sessionId,
 
     // Bind socket to a particular host connection
     error = sock_bind(newConn->socket,(sockaddr*)hostSockaddr);
-    IOLog("ISCSIX: sock_bind hostfamily=%d err=%d\n",hostSockaddr->ss_family,error);
     if(error)
         goto SOCKET_BIND_FAILURE;
 
     // Connect the socket to the target node
     error = sock_connect(newConn->socket,(sockaddr*)portalSockaddr,0);
-    IOLog("ISCSIX: sock_connect err=%d\n",error);
     if(error)
         goto SOCKET_CONNECT_FAILURE;
 
@@ -1683,13 +1843,13 @@ void iSCSIVirtualHBA::ReleaseConnection(SessionIdentifier sessionId,
     if(!connection)
         return;
     
-    // First deactivate connection before proceeding
-    if(connection->taskQueue->isEnabled())
-        DeactivateConnection(sessionId,connectionId);
+    // Always drain queued requests before releasing the connection.
+    DeactivateConnection(sessionId,connectionId);
 
     // Prevents other from trying to access this connection...
     session->connections[connectionId] = NULL;
     
+    sock_shutdown(connection->socket,SHUT_RDWR);
     sock_close(connection->socket);
 
     GetWorkLoop()->removeEventSource(connection->dataRecvEventSource);
@@ -1798,34 +1958,22 @@ errno_t iSCSIVirtualHBA::DeactivateConnection(SessionIdentifier sessionId,Connec
     if(!connection)
         return EINVAL;
 
+    const bool wasActive = connection->taskQueue->isEnabled();
+
     connection->dataRecvEventSource->disable();
     connection->taskQueue->disable();
-    
-    // Tell driver stack that tasks have been rejected (stack will reattempt
-    // the task on a different connection, if one is available)
-    UInt32 initiatorTaskTag = 0;
-    SCSIParallelTaskIdentifier task;
- 
-    while((initiatorTaskTag = connection->taskQueue->completeCurrentTask()) != 0)
-    {
-        task = FindTaskForControllerIdentifier(sessionId, initiatorTaskTag);
-        if(!task)
-            continue;
-        
-        // Notify the SCSI driver stack that we couldn't finish these tasks
-        // on this connection
-        CompleteParallelTask(session,
-                             connection,
-                             task,
-                             kSCSITaskStatus_DeliveryFailure,
-                             kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE);
-    }
 
-    OSDecrementAtomic(&session->numActiveConnections);
-    
-    // If this is the last active connection, un-mount the target
-    if(session->numActiveConnections == 0)
-        DestroyTargetForID(sessionId);
+    // Every request accepted with Request_In_Process must be completed,
+    // including a valid initiator task tag of 0.
+    FailPendingTasksForConnection(session,connection);
+
+    if(wasActive && session->numActiveConnections > 0)
+    {
+        OSDecrementAtomic(&session->numActiveConnections);
+
+        if(session->numActiveConnections == 0)
+            DestroyTargetForID(sessionId);
+    }
     
     DBLog("iscsi: Deactivated connection (sid: %d, cid: %d)\n",sessionId,connectionId);
     
@@ -1885,6 +2033,9 @@ errno_t iSCSIVirtualHBA::SendPDU(iSCSISession * session,
     // Range-check inputs
     if(!session || !connection || !bhs)
         return EINVAL;
+
+    if(shuttingDown)
+        return ESHUTDOWN;
     
     // Set the command sequence number & expected status sequence number
     if(bhs->opCodeAndDeliveryMarker != kiSCSIPDUOpCodeDataOut) {
@@ -1970,7 +2121,6 @@ errno_t iSCSIVirtualHBA::SendPDU(iSCSISession * session,
     errno_t error;
     
     error = sock_send(connection->socket,&msg,0,&bytesSent);
-    IOLog("ISCSIX: SendPDU sock_send err=%d bytesSent=%zu\n",error,bytesSent);
     if(error)
     {
         DBLog("iscsi: sock_send error returned with code %d (sid: %d, cid: %d)\n",error,session->sessionId,connection->cid);
@@ -2042,7 +2192,6 @@ errno_t iSCSIVirtualHBA::RecvPDUHeader(iSCSISession * session,
 
     // Handle connection problems
     error = sock_receive(connection->socket,&msg,MSG_WAITALL,&bytesRecv);
-    IOLog("ISCSIX: RecvPDUHeader sock_receive err=%d bytesRecv=%zu useHdrDigest=%d\n",error,bytesRecv,connection->useHeaderDigest);
     if(error)
     {
         if(error != EWOULDBLOCK) {

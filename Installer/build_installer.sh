@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 ROOT=".."
 BUILD="$ROOT/build"
 APP="$ROOT/App/build/iSCSI.app"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 PKG_ID="com.github.iscsi-osx.installer"
 
 for f in "$BUILD/iSCSIInitiator.kext" "$BUILD/iSCSI.framework" "$BUILD/iscsid" "$BUILD/iscsictl" "$APP"; do
